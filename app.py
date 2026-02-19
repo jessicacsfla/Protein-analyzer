@@ -1,7 +1,7 @@
 import streamlit as st
 import requests
 import re
-from Bio import Entrez, SeqIO, __version__ as biopython_version
+from Bio import Entrez, SeqIO
 from Bio.SeqUtils.ProtParam import ProteinAnalysis
 import plotly.graph_objects as go
 
@@ -22,13 +22,13 @@ def trigger_analysis():
 # -------------------------
 source = st.selectbox("Select input source", ["UniProt", "NCBI", "KEGG"])
 protein_id = st.text_input("Enter protein ID", key="protein_input", on_change=trigger_analysis)
-
-# Fetch & Analyze button
 fetch_button = st.button("Fetch & Analyze", on_click=trigger_analysis)
 
-# Run analysis if triggered
+# -------------------------
+# Run analysis
+# -------------------------
 if st.session_state.run_analysis:
-    st.session_state.run_analysis = False  # reset trigger
+    st.session_state.run_analysis = False
 
     if not protein_id:
         st.warning("Please enter a protein ID.")
@@ -77,9 +77,9 @@ if st.session_state.run_analysis:
             st.error(f"Error fetching sequence: {e}")
 
         if sequence:
-            st.success(f"Sequence retrieved successfully! Length: {len(sequence)} aa")
+            st.success("Sequence retrieved successfully!")
             st.write(f"Organism: {organism}")
-            st.write(f"Biopython version: {biopython_version}")
+            st.write(f"Length: {len(sequence)} aa")
 
             # -------------------------
             # Basic properties
@@ -95,7 +95,7 @@ if st.session_state.run_analysis:
             st.write(f"Total Cysteines: {cysteine_count}")
 
             # -------------------------
-            # Extinction coefficient (tuple-based for Biopython 1.85)
+            # Extinction coefficient
             # -------------------------
             try:
                 ec_reduced, ec_disulfide = analysis.molar_extinction_coefficient()
@@ -106,51 +106,84 @@ if st.session_state.run_analysis:
                 st.warning(f"Could not calculate extinction coefficient: {e}")
 
             # -------------------------
-            # Hierarchical motif detection
-            # -------------------------
-            motif_definitions = [
-                {"type": "4Fe-4S", "pattern": r"C.{2,12}C.{2,12}C.{2,20}C", "c_count": 4},
-                {"type": "3Fe-4S", "pattern": r"C.{2,15}C.{2,15}C", "c_count": 3},
-                {"type": "2Fe-2S", "pattern": r"C.{1,10}C.{1,10}C", "c_count": 2},
-                {"type": "rubredoxin_short", "pattern": r"C.{1,4}C.{4,12}C.{1,4}C", "c_count": 4},
-                {"type": "rubredoxin_long", "pattern": r"C.{2}C.{15,40}C.{2}C", "c_count": 4},
-            ]
-
-            assigned_motifs = []
-            occupied_positions = set()
-
-            for mf_def in motif_definitions:
-                pattern = re.compile(mf_def["pattern"])
-                for match in pattern.finditer(sequence):
-                    start = match.start()
-                    end = match.end()
-                    if any(pos in occupied_positions for pos in range(start, end)):
-                        continue
-                    motif_seq = match.group()
-                    c_positions = [m.start() for m in re.finditer("C", motif_seq)]
-                    if len(c_positions) != mf_def["c_count"]:
-                        continue
-                    spacings = [c_positions[i+1]-c_positions[i]-1 for i in range(len(c_positions)-1)]
-                    assigned_motifs.append({
-                        "type": mf_def["type"],
-                        "start": start,
-                        "motif": motif_seq,
-                        "spacings": spacings
-                    })
-                    occupied_positions.update(range(start, end))
-
-            # -------------------------
-            # Display motifs
+            # CYSTEINE-ANCHORED MOTIF DETECTION (all clusters)
             # -------------------------
             st.subheader("Detected Fe-S & Rubredoxin Motifs")
-            if assigned_motifs:
-                for mf in assigned_motifs:
-                    st.write(f"{mf['type']} | Position {mf['start']+1}: {mf['motif']} | Spacings: {mf['spacings']}")
+
+            cys_positions = [i for i, aa in enumerate(sequence) if aa == "C"]
+            detected_regions = []
+
+            def classify_cluster_by_spacings(cys_spacings):
+                # Unpack spacings
+                n = len(cys_spacings)
+                if n == 3:
+                    s1, s2, s3 = cys_spacings
+
+                    # Classic Fe-S clusters
+                    if 2 <= s1 <= 12 and 2 <= s2 <= 12 and 2 <= s3 <= 12:
+                        return "4Fe-4S"
+                    if 1 <= s1 <= 10 and 20 <= s2 <= 60 and 1 <= s3 <= 10:
+                        return "2Fe-2S"
+                    if 2 <= s1 <= 4 and 15 <= s2 <= 40 and 2 <= s3 <= 4:
+                        return "Rubredoxin (long)"
+                    if 1 <= s1 <= 4 and 4 <= s2 <= 12 and 1 <= s3 <= 4:
+                        return "Rubredoxin (short)"
+                    if s1 == 3 and s2 == 2 and s3 == 2:
+                        return "Radical SAM (CxxxCxxC)"
+                    if 1 <= s1 <= 3 and 15 <= s2 <= 30 and 1 <= s3 <= 3:
+                        return "Rieske [2Fe-2S] (Cys-His)"
+                    if 2 <= s1 <= 2 and 20 <= s2 <= 35 and s3 >= 1:
+                        return "FeFe Hydrogenase H-cluster"
+                elif n == 4:
+                    s1, s2, s3, s4 = cys_spacings
+                    # A-cluster
+                    if 10 <= s1 <= 40 and 2 <= s2 <= 2 and 10 <= s3 <= 40:
+                        return "A-cluster (ACS candidate)"
+                    # C-cluster
+                    if all(5 <= s <= 25 for s in (s1, s2, s3, s4)):
+                        return "C-cluster (CODH candidate)"
+                elif n == 5:
+                    # P-cluster (Nitrogenase)
+                    if all(10 <= s <= 60 for s in cys_spacings):
+                        return "P-cluster (Nitrogenase candidate)"
+                return None
+
+            # Loop through cysteines as anchors
+            for i in range(len(cys_positions)):
+                for j in range(3, 6):  # Check next 3–5 cysteines
+                    if i + j >= len(cys_positions):
+                        continue
+                    selected_cys = cys_positions[i:i+j+1]
+                    spacings = [selected_cys[k+1]-selected_cys[k]-1 for k in range(len(selected_cys)-1)]
+                    cluster_type = classify_cluster_by_spacings(spacings)
+                    if cluster_type:
+                        detected_regions.append({
+                            "type": cluster_type,
+                            "start": selected_cys[0],
+                            "end": selected_cys[-1]+1,
+                            "motif": sequence[selected_cys[0]:selected_cys[-1]+1],
+                            "spacings": spacings
+                        })
+
+            # Remove duplicates
+            unique_regions = []
+            for region in detected_regions:
+                if not any(r["start"] == region["start"] and r["end"] == region["end"]
+                           for r in unique_regions):
+                    unique_regions.append(region)
+
+            if unique_regions:
+                for idx, region in enumerate(unique_regions, 1):
+                    st.markdown(f"### Cluster {idx}")
+                    st.write(f"Type: {region['type']}")
+                    st.write(f"Position: {region['start']+1}-{region['end']}")
+                    st.write(f"Spacing: {region['spacings']}")
+                    st.code(region["motif"])
             else:
                 st.write("No Fe-S or rubredoxin motifs detected.")
 
             # -------------------------
-            # Cysteine density
+            # Cysteine density plot
             # -------------------------
             positions = list(range(1, len(sequence)+1))
             densities = [1 if aa=="C" else 0 for aa in sequence]
@@ -169,8 +202,8 @@ if st.session_state.run_analysis:
                 height=250,
                 margin=dict(l=20, r=20, t=20, b=20),
                 xaxis_title="Residue position",
-                yaxis_title="Cysteine density",
-                yaxis=dict(range=[0, max(densities)+1])
+                yaxis_title="Cysteine presence",
+                yaxis=dict(range=[0, 1.1])
             )
 
             st.plotly_chart(fig)
@@ -185,4 +218,8 @@ if st.session_state.run_analysis:
                     html_seq += f'<span style="background-color:yellow">{aa}</span>'
                 else:
                     html_seq += aa
-            st.markdown(f'<div style="overflow-x:auto; white-space:pre">{html_seq}</div>', unsafe_allow_html=True)
+
+            st.markdown(
+                f'<div style="overflow-x:auto; white-space:pre-wrap; font-family:monospace">{html_seq}</div>',
+                unsafe_allow_html=True
+            )
